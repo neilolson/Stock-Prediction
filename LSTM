@@ -1,0 +1,740 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from tensorflow import keras
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import optimizers
+
+from keras.models import Sequential, Model
+from keras.layers import LSTM, Dropout, Dense, Input, Conv1D, MaxPooling1D, Flatten, Attention, MaxPooling1D
+from keras_self_attention import SeqSelfAttention
+from keras_tuner import RandomSearch
+
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.svm import SVR
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
+from sklearn.ensemble import IsolationForest
+
+timeframes = ['3m', '5m', '10m', '15m', '30m', '1h', '4h', '1d', '1w']
+num_features = 45
+sequence_length = 10
+input_shape = (sequence_length, num_features)
+encoder_input = Input(shape=input_shape, name='encoder_input')
+encoder_out = LSTM(units=64, return_sequences=True, name='encoder_lstm')(encoder_input)
+
+lstm_units_options = [32, 64, 128]
+learning_rate_options = [0.001, 0.01]
+batch_size_options = [32, 64]
+
+df = pd.read_csv(
+    r'Path to you stock data. filename.csv'
+)
+
+df['end_time'] = pd.to_datetime(df['end_time'])
+df.set_index('end_time', inplace=True)
+df.index = df.index.tz_convert(None)
+
+def ohlc_resample(dataframe, time_frame):
+    aggregation = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'candle_volume': 'sum',
+        'total_volume': 'sum',
+        'start_total_volume': 'first'
+    }
+    resampled_df = dataframe.resample(time_frame).agg(aggregation)
+    return resampled_df
+
+resampled_dfs = {
+    '3m': ohlc_resample(df, '3T'),
+    '5m': ohlc_resample(df, '5T'),
+    '10m': ohlc_resample(df, '10T'),
+    '15m': ohlc_resample(df, '15T'),
+    '30m': ohlc_resample(df, '30T'),
+    '1h': ohlc_resample(df, '1H'),
+    '4h': ohlc_resample(df, '4H'),
+    '1d': ohlc_resample(df, '1D'),
+    '1w': ohlc_resample(df, '1W')
+}
+
+# Iterate through each resampled dataframe to print the headers, first 5 rows, and last row
+for timeframe, resampled_df in resampled_dfs.items():
+    print(f"Timeframe: {timeframe}")
+    print("Headers:", resampled_df.columns.tolist())
+    print("First 5 rows:")
+    print(resampled_df.head())
+    print("Last row:")
+    print(resampled_df.tail(1))
+    print("\n" + "#" * 50 + "\n")
+
+df_list = [df_3m, df_5m, df_10m, df_15m, df_30m, df_1h, df_4h, df_1d, df_1w]
+
+for timeframe, df in zip(timeframes, df_list):
+    # Forward fill to replace NaN values with the previous non-NaN value
+    df.fillna(method='ffill', inplace=True)
+    print(f"Timeframe: {timeframe}")
+    print("Headers:", df.columns.tolist())
+    print("First 5 rows:")
+    print(df.head(5))
+    print("Last row:")
+    print(df.tail(1))
+    print("\n" + "#" * 50 + "\n")
+
+def calculate_ema(dataframe):
+    for period in [8, 12, 21, 26, 34, 48, 100, 200]:
+        dataframe[f'EMA_{period}'] = dataframe['close'].ewm(span=period, adjust=False).mean()
+
+def calculate_rsi(dataframe, column='close', period=14):
+    delta = dataframe[column].diff()
+    up, down = delta.copy(), delta.copy()
+    up[up < 0] = 0
+    down[down > 0] = 0
+
+    roll_up = up.ewm(span=period).mean()
+    roll_down = down.abs().ewm(span=period).mean()
+
+    RS = roll_up / roll_down
+    RSI = 100.0 - (100.0 / (1.0 + RS))
+
+    dataframe['RSI'] = RSI
+
+def calculate_macd(dataframe, n_fast=12, n_slow=26, n_signal=9):
+    EMA_fast = dataframe['close'].ewm(span=n_fast, min_periods=n_fast).mean()
+    EMA_slow = dataframe['close'].ewm(span=n_slow, min_periods=n_slow).mean()
+    dataframe['MACD'] = EMA_fast - EMA_slow
+    dataframe['Signal_Line'] = dataframe['MACD'].ewm(span=n_signal, min_periods=n_signal).mean()
+
+def calculate_atr(dataframe, period=14):
+    high_low = dataframe['high'] - dataframe['low']
+    high_close = np.abs(dataframe['high'] - dataframe['close'].shift())
+    low_close = np.abs(dataframe['low'] - dataframe['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    ATR = true_range.rolling(window=period, min_periods=1).mean()
+    dataframe['ATR'] = ATR.fillna(method='bfill')
+
+def calculate_adx(df, period=14):
+    df['+DM'] = np.where((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low']), 
+                          df['high'] - df['high'].shift(1), 0)
+    df['+DM'] = np.where(df['+DM'] < 0, 0, df['+DM'])
+    df['-DM'] = np.where((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1)), 
+                          df['low'].shift(1) - df['low'], 0)
+    df['-DM'] = np.where(df['-DM'] < 0, 0, df['-DM'])
+
+    tr_list = [df['high'] - df['low'], 
+               df['high'] - df['close'].shift(), 
+               df['low'] - df['close'].shift()]
+    tr = pd.concat(tr_list, axis=1)
+    df['TR'] = tr.max(axis=1)
+
+    df['TR_smooth'] = df['TR'].rolling(period).sum() - (df['TR'].rolling(period).sum() / period) + df['TR']
+    df['+DM_smooth'] = df['+DM'].rolling(period).sum() - (df['+DM'].rolling(period).sum() / period) + df['+DM']
+    df['-DM_smooth'] = df['-DM'].rolling(period).sum() - (df['-DM'].rolling(period).sum() / period) + df['-DM']
+
+    df['+DI'] = (df['+DM_smooth'] / df['TR_smooth']) * 100
+    df['-DI'] = (df['-DM_smooth'] / df['TR_smooth']) * 100
+    df['DX'] = (np.abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI'])) * 100
+    df['ADX'] = df['DX'].rolling(period).mean()
+
+    return df.drop(['+DM', '-DM', 'TR', 'TR_smooth', '+DM_smooth', '-DM_smooth', '+DI', '-DI', 'DX'], axis=1)
+
+def calculate_stochastic_oscillator(df, period=14):
+    df['L14'] = df['low'].rolling(window=14).min()
+    df['H14'] = df['high'].rolling(window=14).max()
+    df['%K'] = 100 * ((df['close'] - df['L14']) / (df['H14'] - df['L14']))
+    df['%D'] = df['%K'].rolling(window=3).mean()
+
+    return df.drop(['L14', 'H14'], axis=1)
+
+def calculate_ttm_squeeze(df, bollinger_period=20, bollinger_std=2, keltner_period=20, keltner_mult=1.5):
+    # Calculate Bollinger Bands
+    df['mid_band'] = df['close'].rolling(window=bollinger_period).mean()
+    df['std_dev'] = df['close'].rolling(window=bollinger_period).std()
+    df['upper_bollinger'] = df['mid_band'] + (bollinger_std * df['std_dev'])
+    df['lower_bollinger'] = df['mid_band'] - (bollinger_std * df['std_dev'])
+
+    # Calculate Keltner Channel
+    df['ema'] = df['close'].ewm(span=keltner_period).mean()
+    df['range'] = df['high'] - df['low']
+    df['atr'] = df['range'].rolling(window=keltner_period).mean()
+    df['upper_keltner'] = df['ema'] + (keltner_mult * df['atr'])
+    df['lower_keltner'] = df['ema'] - (keltner_mult * df['atr'])
+
+    # Determine if the market is in a squeeze
+    df['squeeze_on'] = (df['lower_bollinger'] > df['lower_keltner']) & (df['upper_bollinger'] < df['upper_keltner'])
+
+    return df.drop(['mid_band', 'std_dev', 'upper_bollinger', 'lower_bollinger', 'ema', 'range', 'atr', 'upper_keltner', 'lower_keltner'], axis=1)
+    
+def calculate_technical_indicators(df):
+    calculate_ema(df)
+    calculate_rsi(df)
+    calculate_atr(df)
+    calculate_macd(df)
+    calculate_adx(df)
+    calculate_stochastic_oscillator(df)
+    calculate_ttm_squeeze(df)
+    return df
+
+timeframes = ['3m', '5m', '10m', '15m', '30m', '1h', '4h', '1d', '1w']
+for tf in timeframes:
+    # Assuming globals()[f'df_{tf}'] fetches the correct dataframe
+    df = globals()[f'df_{tf}']
+    df = calculate_technical_indicators(df)
+    
+    # Print header and first 5 rows
+    print(f"Timeframe {tf} - Technical Indicators Added:")
+    print(df.head())
+    
+# Create features dataframes for each timeframe
+df_3m_features = df_3m[features]
+df_5m_features = df_5m[features]
+df_10m_features = df_10m[features]
+df_15m_features = df_15m[features]
+df_30m_features = df_30m[features]
+df_1h_features = df_1h[features]
+df_4h_features = df_4h[features]
+df_1d_features = df_1d[features]
+df_1w_features = df_1w[features]
+
+def fill_na_with_mode(dataframe):
+    filled_dataframe = dataframe.copy()
+    for column in filled_dataframe.columns:
+        mode_value = filled_dataframe[column].mode()[0]
+        filled_dataframe[column].fillna(mode_value, inplace=True)
+    return filled_dataframe
+
+df_3m_features = df_3m[features].copy()
+df_5m_features = df_5m[features].copy()
+df_10m_features = df_10m[features].copy()
+df_15m_features = df_15m[features].copy()
+df_30m_features = df_30m[features].copy()
+df_1h_features = df_1h[features].copy()
+df_4h_features = df_4h[features].copy()
+df_1d_features = df_1d[features].copy()
+df_1w_features = df_1w[features].copy()
+
+df_3m_features = fill_na_with_mode(df_3m_features)
+df_5m_features = fill_na_with_mode(df_5m_features)
+df_10m_features = fill_na_with_mode(df_10m_features)
+df_15m_features = fill_na_with_mode(df_15m_features)
+df_30m_features = fill_na_with_mode(df_30m_features)
+df_1h_features = fill_na_with_mode(df_1h_features)
+df_4h_features = fill_na_with_mode(df_4h_features)
+df_1d_features = fill_na_with_mode(df_1d_features)
+df_1w_features = fill_na_with_mode(df_1w_features)
+
+dfs= [
+    df_3m_features,
+    df_5m_features,
+    df_10m_features,
+    df_15m_features,
+    df_30m_features,
+    df_1h_features,
+    df_4h_features,
+    df_1d_features,
+    df_1w_features
+]
+
+def calculate_normalized_rsi(df, period=14):
+    # Compute the RSI value
+    rsi = calculate_rsi(dataframe, period)
+    # Normalize the RSI values to the range [0, 1]
+    dataframe['normalized_rsi'] = (rsi - 30) / (70 - 30)
+    dataframe['normalized_rsi'] = dataframe['normalized_rsi'].clip(0, 1)
+
+def calculate_momentum_feature(df):
+    # Simplified example:
+    # Positive ADX signal
+    df['adx_signal'] = df['ADX'].apply(lambda x: 1 if x > 25 else (-1 if x < 20 else 0))
+    # Stochastic signal: %K above %D as positive
+    df['stochastic_signal'] = np.where(df['%K'] > df['%D'], 1, -1)
+    # Combine signals into a single momentum feature, normalized
+    df['momentum_feature'] = (df['adx_signal'] + df['stochastic_signal']) / 2
+    return df
+
+def combine_momentum_signals(df):
+    # Assuming normalized signals have been calculated for RSI, Stochastic, and ADX
+    df['momentum_score'] = (
+        df['normalized_rsi'] + 
+        df['normalized_%K'] + 
+        df['normalized_adx']
+    ) / 3  # Averaging the normalized scores
+    
+def calculate_momentum_indicator(df):
+    # Normalize ADX: Above 25 is strong bullish, below 20 is strong bearish
+    df['normalized_adx'] = df['ADX'].apply(lambda x: 1 if x > 25 else (-1 if x < 20 else 0))
+    
+    # Normalize RSI: Above 70 is strong bullish, below 30 is strong bearish
+    df['normalized_rsi'] = df['RSI'].apply(lambda x: 1 if x > 70 else (-1 if x < 30 else 0))
+    
+    # Stochastic signal: %K above %D and both above 80 is strong bullish, %K below %D and both below 20 is strong bearish
+    df['stochastic_signal'] = df.apply(
+        lambda row: 1 if row['%K'] > row['%D'] and row['%K'] > 80 else (-1 if row['%K'] < row['%D'] and row['%K'] < 20 else 0),
+        axis=1
+    )
+    
+    # Combine the signals
+    df['momentum_feature'] = df[['normalized_adx', 'normalized_rsi', 'stochastic_signal']].mean(axis=1)
+    df = create_combined_momentum_feature(df)
+    return df
+
+for tf, df in zip(timeframes, [df_3m, df_5m, df_10m, df_15m, df_30m, df_1h, df_4h, df_1d, df_1w]):
+    updated_df = calculate_momentum_indicator(df)
+    globals()[f'df_{tf}_features'] = updated_df  # Update global variable with the modified DataFrame
+    
+    # Print header and first 5 rows after adding the momentum indicator
+    print(f"Timeframe {tf} - Momentum Indicator Added:")
+    print(updated_df.head())
+
+# Forward fill and print updated DataFrames
+def forward_fill_and_print(df, timeframe):
+    # Your forward fill and print logic here is correct
+    df.ffill(inplace=False)
+    # Fill NaN values in indicators
+    indicator_columns = ['EMA_8', 'EMA_12', 'EMA_21', 'EMA_26', 'EMA_34', 'mid_band', 'std_dev', 'upper_bollinger', 'lower_bollinger', 'ema', 'range', 'atr', 'upper_keltner', 'lower_keltner']
+    for col in indicator_columns:
+        if df[col].isna().any():
+            df[col].fillna(df[col].dropna().iloc[0], inplace=False)
+    if 'squeeze_on' in df.columns:
+        df['squeeze_on'].fillna(False, inplace=True)
+    
+    print(f"Timeframe {timeframe} - Technical Indicators Updated:")
+    print(df.head())
+    print("\n" + "#" * 50 + "\n")
+
+for tf in timeframes:
+    df = globals()[f'df_{tf}_features']
+    forward_fill_and_print(df, tf)
+    
+def forward_fill_and_print(df, timeframe):
+    # Forward fill NaN values
+    df.ffill(inplace=True)
+
+    # Fill NaN values in indicators that are still NaN after ffill (e.g., at the beginning of the dataset)
+    indicator_columns = ['EMA_8', 'EMA_12', 'EMA_21', 'EMA_26', 'EMA_34', 'mid_band', 'std_dev', 'upper_bollinger', 'lower_bollinger', 'ema', 'range', 'atr', 'upper_keltner', 'lower_keltner']
+    for col in indicator_columns:
+        if df[col].isna().any():
+            # For simplicity, fill NaNs with the first valid value in the column
+            df[col].fillna(df[col].dropna().iloc[0], inplace=True)
+    
+    # Assuming 'squeeze_on' is a boolean column, fill NaNs with False
+    if 'squeeze_on' in df.columns:
+        df['squeeze_on'].fillna(False, inplace=True)
+    
+    # Print updated DataFrame
+    print(f"Timeframe {timeframe} - Technical Indicators Updated:")
+    print(df.head())
+    print("\n" + "#" * 50 + "\n")
+
+timeframes = ['3m', '5m', '10m', '15m', '30m', '1h', '4h', '1d', '1w']
+df_list = [df_3m, df_5m, df_10m, df_15m, df_30m, df_1h, df_4h, df_1d, df_1w]
+
+for timeframe, df in zip(timeframes, df_list):
+    forward_fill_and_print(df, timeframe)
+
+# Function to combine all the momentum signals into one feature
+def calculate_momentum_indicator(df):
+    # Normalize and combine the ADX, stochastic, and TTM Squeeze indicators
+    df['momentum_feature'] = (
+        df['ADX'].apply(lambda x: 1 if x > 25 else (-1 if x < 20 else 0)) +
+        df.apply(lambda row: 1 if row['%K'] > row['%D'] else (-1 if row['%K'] < row['%D'] else 0), axis=1) +
+        df['squeeze_on'].apply(lambda x: 1 if x else 0)
+    )
+    # Normalize the combined feature to be between -1 and 1
+    df['momentum_feature'] = df['momentum_feature'] / df['momentum_feature'].abs().max()
+    df = create_combined_momentum_feature(df)
+    return df
+
+for tf in timeframes:
+    df = globals()[f'df_{tf}']
+    df = calculate_momentum_indicator(df)
+    
+    # Update the global variable with the new dataframe
+    globals()[f'df_{tf}_features'] = df
+    
+    # Print header and first 5 rows after adding the momentum indicator
+    print(f"Timeframe {tf} - Momentum Indicator Added:")
+    print(df.head())
+
+models = {}
+history_dict = {}
+scaled_data_dict = {}
+scaled_features_dict = {}
+
+predictions_dict = {}
+ypredictions_dict = {}
+rmse_dict = {}
+mae_dict = {}
+mape_dict = {}
+
+def fill_na_with_mode(df):
+    filled_dataframe = df.copy()
+    for column in filled_dataframe.columns:
+        mode_value = filled_dataframe[column].mode()[0]
+        filled_dataframe[column].fillna(mode_value, inplace=False)
+    return filled_dataframe
+
+timeframes = ['3m', '5m', '10m', '15m', '30m', '1h', '4h', '1d', '1w']
+
+dfs_filled = [fill_na_with_mode(df) for df in dfs]
+
+for tf, df_filled in zip(timeframes, dfs_filled):
+    print(f"Timeframe {tf} processed. Column headers:")
+    print(df_filled.columns.tolist())
+
+def fill_na_with_mode(df):
+    filled_dataframe = df.copy()
+    for column in filled_dataframe.columns:
+        mode_value = filled_dataframe[column].mode()[0]
+        filled_dataframe[column].fillna(mode_value, inplace=True)  # Corrected inplace to True
+    return filled_dataframe
+
+for tf in timeframes:
+    df = globals()[f'df_{tf}']
+    df_filled = fill_na_with_mode(df)  # Fill missing values
+    df_updated = calculate_momentum_indicator(df_filled)  # Calculate momentum indicator
+    
+    # Update the global variable with the new dataframe
+    globals()[f'df_{tf}_features'] = df_updated
+
+def replace_inf_with_nan(df):
+    return df.replace([np.inf, -np.inf], np.nan)
+
+def preprocess_dataframe(df):
+    df = replace_inf_with_nan(df)  # Step 1: Replace infinities
+    df_filled = fill_na_with_mode(df)  # Step 2: Fill missing values
+    return df_filled
+
+for tf in timeframes:
+    df = globals()[f'df_{tf}']
+    df_preprocessed = preprocess_dataframe(df)
+    globals()[f'df_{tf}_preprocessed'] = df_preprocessed
+
+def scale_features(timeframes):
+    scalers = {}
+    scaled_features = {}
+    for timeframe in timeframes:
+        df_features = globals()[f'df_{timeframe}_preprocessed']
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        df_features.dropna(inplace=True)
+        scaled_data = scaler.fit_transform(df_features)
+        scaled_features[timeframe] = scaled_data
+        scalers[timeframe] = scaler
+    return scaled_features, scalers
+
+scaled_features, scalers = scale_features(timeframes)
+
+results = []
+
+for tf in timeframes:
+    df = globals()[f'df_{tf}']
+    df_preprocessed = preprocess_dataframe(df)
+    globals()[f'df_{tf}_preprocessed'] = df_preprocessed
+
+def create_sequences(data, sequence_length=10, target_col_index=0):
+    X, y = [], []
+    if isinstance(data, pd.DataFrame):
+        data = data.values  # Convert DataFrame to NumPy array for uniform processing
+
+    for i in range(len(data) - sequence_length):
+        X.append(data[i:(i + sequence_length), :])  # Access rows for the sequence
+        y.append(data[i + sequence_length, target_col_index])  # Access the target variable
+
+    return np.array(X), np.array(y)
+
+sequences = {}
+for timeframe, scaled_data in scaled_features.items():
+    # Ensure data is of type float32
+    scaled_data = scaled_data.astype('float32')
+    
+    # Then, create sequences
+    X, y = create_sequences(scaled_data, sequence_length=10, target_col_index=0)
+    sequences[timeframe] = (X, y)    
+
+# Assuming `sequences` dictionary is correctly filled as shown in the previous steps
+def train_test_split_sequences(X, y, test_size=0.2):
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+    return X_train, X_test, y_train, y_test
+
+# Define the model building and training function
+def build_and_train_model(X_train, y_train, X_test, y_test, input_shape, lstm_units=64, dropout_rate=0.2, learning_rate=0.001, epochs=50, batch_size=32):
+    inputs = Input(shape=input_shape)
+    lstm_out = LSTM(units=lstm_units, return_sequences=True)(inputs)
+    lstm_out = Dropout(dropout_rate)(lstm_out)
+    query_value_attention_seq = Attention()([lstm_out, lstm_out])
+    attention_output = Flatten()(query_value_attention_seq)
+    x = Dense(50, activation='relu')(attention_output)
+    outputs = Dense(1)(x)
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(optimizer=optimizers.Adam(learning_rate=learning_rate), loss='mean_squared_error')
+    history = model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, validation_data=(X_test, y_test), verbose=1)
+    return model, history
+
+# Initialize dictionary to store models
+models = {}
+
+# Loop through each timeframe to prepare data, split, and train models
+for timeframe, scaled_data in scaled_features.items():
+    X, y = create_sequences(scaled_data, sequence_length=10, target_col_index=0)  # Ensure scaled_data is correctly defined and preprocessed
+    X_train, X_test, y_train, y_test = train_test_split_sequences(X, y, test_size=0.2)
+
+    try:
+        model, history = build_and_train_model(X_train, y_train, X_test, y_test, input_shape=X_train.shape[1:], lstm_units=64, dropout_rate=0.2, learning_rate=0.001, epochs=50, batch_size=32)
+        models[timeframe] = model
+        print(f"Model trained for timeframe {timeframe}")
+    except Exception as e:
+        print(f"Error creating model for timeframe {timeframe}: {e}")
+
+for timeframe, (X, y) in sequences.items():
+    X_train, X_test, y_train, y_test = train_test_split_sequences(X, y, test_size=0.2)
+    try:
+        model, history = build_and_train_model(
+            X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, 
+            input_shape=X_train.shape[1:], 
+            lstm_units=64, 
+            dropout_rate=0.2, 
+            learning_rate=0.001, 
+            epochs=50, 
+            batch_size=32
+        )
+        models[timeframe] = model
+        print(f"Model trained for timeframe {timeframe}")
+    except Exception as e:
+        print(f"Error creating model for timeframe {timeframe}: {e}")
+
+def process_data(X, y):
+    print("Processing data...")
+    result = {"info": "Processed data for X and y"}
+    return result
+
+# Loop through each timeframe
+for timeframe in time_frames:
+    scaled_data = scaled_features[timeframe]
+    X, y = create_sequences(scaled_data, sequence_length=10, target_col_index=0)  # Adjust as needed
+
+    print(f"Timeframe {timeframe}: X shape {X.shape}, y shape {y.shape}")
+    
+    # Check if data is empty
+    if X.size == 0:
+        raise Exception("X is empty.")
+    if y.size == 0:
+        raise Exception("y is empty.")
+
+    # Process the data and append the result
+    result = process_data(X, y)
+    results.append(result)
+
+for timeframe in timeframes:
+    model = models.get(timeframe)
+    if model is not None:
+        X_test, y_test = sequences[timeframe]  # Assuming this provides the correct X_test and y_test
+        
+        # Make predictions
+        predictions = model.predict(X_test).flatten()
+        
+        # Create a dummy array with the correct shape
+        dummy_array = np.zeros((len(predictions), scalers[timeframe].scale_.shape[0]))
+        
+        # Insert predictions into the first column of the dummy array
+        dummy_array[:, 0] = predictions
+        
+        # Inverse transform the dummy array
+        predictions_original_scale = scalers[timeframe].inverse_transform(dummy_array)[:, 0]
+        
+        # Prepare y_test for inverse transformation
+        y_test_dummy = np.zeros((len(y_test), scalers[timeframe].scale_.shape[0]))
+        y_test_dummy[:, 0] = y_test
+        y_test_original_scale = scalers[timeframe].inverse_transform(y_test_dummy)[:, 0]
+        
+        # Calculate metrics
+        rmse = np.sqrt(mean_squared_error(y_test_original_scale, predictions_original_scale))
+        mae = mean_absolute_error(y_test_original_scale, predictions_original_scale)
+        mape = mean_absolute_percentage_error(y_test_original_scale, predictions_original_scale)
+
+        print(f"Timeframe {timeframe}: RMSE: {rmse:.3f}, MAE: {mae:.3f}, MAPE: {mape:.3f}")
+    else:
+        print(f"Model for timeframe {timeframe} is not available.")
+        
+best_model = None
+best_history = None
+lowest_val_loss = float('inf')
+
+for lstm_units in lstm_units_options:
+    for learning_rate in learning_rate_options:
+        for batch_size in batch_size_options:
+            try:
+                model, history = build_and_train_model(X_train, y_train, X_test, y_test, input_shape=(sequence_length, num_features), lstm_units=lstm_units, learning_rate=learning_rate, batch_size=batch_size)
+                if model is not None and history is not None:
+                    val_loss = np.min(history.history['val_loss'])
+                    if val_loss < lowest_val_loss:
+                        best_model = model
+                        best_history = history
+                        lowest_val_loss = val_loss
+            except Exception as e:
+                print(f"Error during model training: {e}")
+
+
+def build_model(hp):
+    try:
+        input_shape = (10, 45)  # Fixed input shape for your sequences
+        model = keras.Sequential()
+        model.add(Input(shape=input_shape))
+    
+        # Allow the tuner to choose the optimal number of units
+        for i in range(hp.Int('num_lstm_layers', 1, 3)):
+            model.add(LSTM(units=hp.Int(f'lstm_units_{i}', min_value=32, max_value=512, step=32),
+                           return_sequences=True if i < hp.get('num_lstm_layers') - 1 else False))
+        
+        model.add(Dense(units=hp.Int('dense_units', 32, 256, step=32), activation='relu'))
+        model.add(Dense(1))
+    
+        # Compile the model
+        model.compile(optimizer=keras.optimizers.Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')),
+                      loss='mean_squared_error')
+    except Exception as e:
+        print(f"Error creating model for timeframe {timeframe}: {e}")
+    
+    return model
+
+tuner = RandomSearch(
+    build_model,
+    objective='val_loss',
+    max_trials=512,  # Set to a reasonable number to find a good model
+    executions_per_trial=1,
+    directory='my_dir',
+    project_name='stock_prediction'
+)
+
+tuner.search(X_train, y_train, epochs=50, validation_data=(X_test, y_test))
+best_hps = tuner.get_best_hyperparameters()[0]
+
+# Rebuild the model using the best hyperparameters
+best_model = build_model(best_hps)
+
+
+# Assuming 'data' is your dataset
+train_data, test_data = train_test_split(dfs, test_size=0.2, shuffle=False)  # Preserving time order
+train_data, val_data = train_test_split(train_data, test_size=0.25, shuffle=False)  # 0.25 x 0.8 = 0.2
+
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
+
+# Define dictionaries to store metrics for each timeframe
+rmse_dict, mae_dict, mape_dict, r2_dict, evs_dict = {}, {}, {}, {}, {}
+
+for i, timeframe in enumerate(timeframes):
+    # Assuming 'model' is your trained model and 'sequences[timeframe]' is (X_test, y_test)
+    
+    # ... Existing code for making predictions ...
+
+    # Calculate evaluation metrics
+    rmse = np.sqrt(mean_squared_error(y_test_original_scale, predictions_original_scale))
+    mae = mean_absolute_error(y_test_original_scale, predictions_original_scale)
+    mape = np.mean(np.abs((y_test_original_scale - predictions_original_scale) / y_test_original_scale)) * 100
+    r2 = r2_score(y_test_original_scale, predictions_original_scale)
+    evs = explained_variance_score(y_test_original_scale, predictions_original_scale)
+    
+    # Store the metrics in dictionaries
+    rmse_dict[timeframe] = rmse
+    mae_dict[timeframe] = mae
+    mape_dict[timeframe] = mape
+    r2_dict[timeframe] = r2
+    evs_dict[timeframe] = evs
+    
+# Assuming you have 9 timeframes
+num_timeframes = len(timeframes)
+fig, axs = plt.subplots(num_timeframes, 1, figsize=(10, 6*num_timeframes))  # Adjust the size as needed
+
+for i, timeframe in enumerate(timeframes):
+    
+    model = models[timeframe]
+    X_test, y_test = sequences[timeframe]
+    
+    # Make predictions
+    predictions = model.predict(X_test).flatten()
+    
+    # Prepare predictions for inverse transformation
+    predictions_padded = np.zeros((len(predictions), 45))  # Assuming 45 features including target
+    predictions_padded[:, 0] = predictions
+    predictions_original_scale = scalers[timeframe].inverse_transform(predictions_padded)[:, 0]
+    
+    # Prepare y_test for inverse transformation
+    y_test_padded = np.zeros((len(y_test), 45))  # Again assuming 45 features including target
+    y_test_padded[:, 0] = y_test
+    y_test_original_scale = scalers[timeframe].inverse_transform(y_test_padded)[:, 0]
+    
+    # Calculate metrics
+    rmse = np.sqrt(mean_squared_error(y_test_original_scale, predictions_original_scale))
+    mae = mean_absolute_error(y_test_original_scale, predictions_original_scale)
+    mape = np.mean(np.abs((y_test_original_scale - predictions_original_scale) / y_test_original_scale)) * 100
+    r2 = r2_score(y_test_original_scale, predictions_original_scale)
+    evs = explained_variance_score(y_test_original_scale, predictions_original_scale)
+    
+    # Plot
+    axs[i].plot(y_test_original_scale, label='Actual Prices', color='blue')
+    axs[i].plot(predictions_original_scale, label='Predicted Prices', color='red')
+    axs[i].set_title(f'Actual vs Predicted Prices for {timeframe} timeframe\nRMSE: {rmse:.2f}, MAE: {mae:.2f}, MAPE: {mape:.2f}%, R-squared: {r2:.2f}, Explained Variance: {evs:.2f}')
+    axs[i].set_xlabel('Time (Index)')
+    axs[i].set_ylabel('Price')
+    axs[i].legend()
+
+plt.tight_layout()  # Adjust subplots to fit into the figure area.
+plt.show()
+
+# Display the best hyperparameters found by the tuner
+best_hyperparameters = tuner.get_best_hyperparameters(num_trials=1)[0]
+print("Best hyperparameters:", best_hyperparameters.values)
+
+# Evaluate the best model on the test set
+eval_results = best_model.evaluate(X_test, y_test, verbose=0)
+print(f"Test Loss: {eval_results}")
+
+# Optionally, display additional metrics such as RMSE
+from sklearn.metrics import mean_squared_error
+from math import sqrt
+
+y_pred = best_model.predict(X_test).flatten()
+rmse = sqrt(mean_squared_error(y_test, y_pred))
+print(f"Test RMSE: {rmse}")
+
+import matplotlib.pyplot as plt
+
+def plot_training_history(history):
+    plt.figure(figsize=(14, 7))
+    
+    # Plot training & validation loss values
+    plt.plot(history.history['loss'], label='Training loss')
+    plt.plot(history.history['val_loss'], label='Validation loss')
+    plt.title('Model Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(loc='upper right')
+    plt.show()
+
+# Plot training history
+if best_history:
+    plot_training_history(best_history)
+
+plt.figure(figsize=(14, 7))
+
+# Predictions
+predictions = best_model.predict(X_test).flatten()
+
+# Plot actual and predicted values
+plt.plot(y_test, label='Actual Prices')
+plt.plot(predictions, label='Predicted Prices')
+plt.title('Actual Prices vs Predicted Prices')
+plt.xlabel('Time (Index)')
+plt.ylabel('Price')
+plt.legend()
+plt.show()
+
+print("Best Model Summary:")
+best_model.summary()
